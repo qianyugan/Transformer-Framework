@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+
+
+# 定义位置编码器
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # 扩展维度以匹配 batch
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+# 构建单个 Encoder 块
+class EncoderBlock(nn.Module):
+    def __init__(self, d_model, n_head, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # 自注意力机制，这里加了 Dropout
+        src2 = self.self_attention(src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+
+        # 前馈神经网络，这里用 ReLU 激活函数以及 Dropout
+        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+
+# 通过堆叠多个 EncoderBlock 构建 Encoder
+class Encoder(nn.Module):
+    def __init__(self, encoder_block, num_blocks, norm=None):
+        super().__init__()
+        self.blocks = nn.ModuleList([encoder_block for _ in range(num_blocks)])
+        self.norm = norm
+
+    def forward(self, src, mask=None, src_key_padding_mask=None):
+        for block in self.blocks:
+            src = block(src, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+        if self.norm is not None:
+            src = self.norm(src)
+        return src
+
+
+# 构建单个 Decoder 块。与 Encoder 类似，但是包含额外的 Encoder-Decoder 层
+class DecoderBlock(nn.Module):
+    def __init__(self, d_model, n_head, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+        self.multi_head_attention = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None,
+                memory_key_padding_mask=None):
+        # 自注意力机制
+        tgt2 = self.self_attention(tgt, tgt, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # 交叉注意力机制
+        tgt2 = \
+            self.multi_head_attention(tgt, memory, memory, attn_mask=memory_mask,
+                                      key_padding_mask=memory_key_padding_mask)[
+                0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # 前馈神经网络
+        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+
+        return tgt
+
+
+# 通过多个堆叠的 DecoderBlock 构建 Decoder
+class Decoder(nn.Module):
+    def __init__(self, decoder_block, num_blocks, norm=None):
+        super().__init__()
+        self.blocks = nn.ModuleList([decoder_block for _ in range(num_blocks)])
+        self.norm = norm
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None,
+                memory_key_padding_mask=None):
+        for block in self.blocks:
+            tgt = block(tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask,
+                        tgt_key_padding_mask=tgt_key_padding_mask, memory_key_padding_mask=memory_key_padding_mask)
+        if self.norm is not None:
+            tgt = self.norm(tgt)
+        return tgt
+
+
+# 将 Encoder 与 Decoder 组合，构建完整 Transformer 模型
+class Transformer(nn.Module):
+    def __init__(self, d_model, n_head, num_encoder_blocks, num_decoder_blocks, dim_feedforward, dropout):
+        super().__init__()
+        encoder_block = EncoderBlock(d_model, n_head, dim_feedforward, dropout)
+        self.encoder = Encoder(encoder_block, num_encoder_blocks)
+
+        decoder_block = DecoderBlock(d_model, n_head, dim_feedforward, dropout)
+        self.decoder = Decoder(decoder_block, num_decoder_blocks)
+
+        self._reset_parameters()
+
+    # 网络参数初始化
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None, src_key_padding_mask=None, tgt_key_padding_mask=None,
+                memory_key_padding_mask=None):
+        memory = self.encoder(src, mask=src_mask, src_key_padding_mask=src_key_padding_mask)
+        output = self.decoder(tgt, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask,
+                              memory_key_padding_mask=memory_key_padding_mask)
+        return output
+
+
+# 测试模型
+d_model = 512
+n_head = 8
+num_encoder_blocks = 6
+num_decoder_blocks = 6
+dim_feedforward = 2048
+dropout = 0.1
+
+model = Transformer(d_model, n_head, num_encoder_blocks, num_decoder_blocks, dim_feedforward, dropout)
+src = torch.rand((10, 32, d_model))  # (sequence_length, batch_size, d_model)
+tgt = torch.rand((10, 32, d_model))  # (sequence_length, batch_size, d_model)
+
+output = model(src, tgt)
+print(output.shape)  # 期望：(tgt_sequence_length, batch_size, d_model)
